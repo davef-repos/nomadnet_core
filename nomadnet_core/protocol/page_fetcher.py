@@ -311,11 +311,13 @@ class PageFetcher:
         """
         try:
             dest_bytes = bytes.fromhex(dest_hash)
+            RNS.log(f"[PageFetcher] Requesting from node {RNS.hexrep(dest_bytes, delimit=False)}, path={path}", RNS.LOG_VERBOSE)
         except (ValueError, AttributeError) as e:
             self._notify_error(PageFetcher.PAGE_ERROR, "Invalid destination hash: " + str(e))
             return
 
         if not RNS.Transport.has_path(dest_bytes):
+            RNS.log(f"[PageFetcher] No path to {RNS.hexrep(dest_bytes, delimit=False)}, requesting path...", RNS.LOG_VERBOSE)
             self.status = PageFetcher.PATH_REQUESTED
             RNS.Transport.request_path(dest_bytes)
 
@@ -325,17 +327,22 @@ class PageFetcher:
             def wait_for_path(dest_bytes, path, request_data):
                 try:
                     timeout = self.DEFAULT_TIMEOUT
+                    RNS.log(f"[PageFetcher] Background thread waiting for path to {RNS.hexrep(dest_bytes, delimit=False)}", RNS.LOG_VERBOSE)
                     path_found = RNS.Transport.await_path(dest_bytes, timeout=timeout)
                     if path_found:
+                        RNS.log(f"[PageFetcher] Path found to {RNS.hexrep(dest_bytes, delimit=False)}", RNS.LOG_VERBOSE)
                         # Double-check we haven't been cancelled/disconnected
                         if self.status in (PageFetcher.CONNECTION_CLOSED, PageFetcher.NO_PATH):
+                            RNS.log(f"[PageFetcher] Cancelled, skipping link establishment", RNS.LOG_VERBOSE)
                             return
                         self.status = PageFetcher.ESTABLISHING_LINK
                         self._establish_link(dest_bytes, path, request_data)
                     else:
+                        RNS.log(f"[PageFetcher] Path timeout for {RNS.hexrep(dest_bytes, delimit=False)}", RNS.LOG_VERBOSE)
                         self._notify_error(PageFetcher.PAGE_NO_PATH,
                                            "No path to " + RNS.hexrep(dest_bytes, delimit=False))
                 except Exception as e:
+                    RNS.log(f"[PageFetcher] Path resolution error: {e}", RNS.LOG_ERROR)
                     self._notify_error(PageFetcher.PAGE_ERROR,
                                        "Path resolution error: " + str(e))
 
@@ -347,6 +354,7 @@ class PageFetcher:
             t.start()
             return
 
+        RNS.log(f"[PageFetcher] Path exists to {RNS.hexrep(dest_bytes, delimit=False)}, establishing link...", RNS.LOG_VERBOSE)
         self.status = PageFetcher.ESTABLISHING_LINK
         self._establish_link(dest_bytes, path, request_data)
 
@@ -360,6 +368,7 @@ class PageFetcher:
             # Recall the identity from the destination hash
             identity = RNS.Identity.recall(dest_bytes)
             if identity is None:
+                RNS.log(f"[PageFetcher] Unknown identity for {RNS.hexrep(dest_bytes, delimit=False)}", RNS.LOG_VERBOSE)
                 self._notify_error(PageFetcher.PAGE_NO_PATH,
                                    "Unknown identity for " + RNS.hexrep(dest_bytes, delimit=False))
                 return
@@ -373,7 +382,23 @@ class PageFetcher:
                 "node",
             )
 
+            # Compute the expected destination hash and verify it matches
+            expected_hash = node_dest.hash
+            if expected_hash != dest_bytes:
+                RNS.log(f"[PageFetcher] Destination hash mismatch: URL has {RNS.hexrep(dest_bytes, delimit=False)} but computed {RNS.hexrep(expected_hash, delimit=False)}", RNS.LOG_WARNING)
+            else:
+                RNS.log(f"[PageFetcher] Destination hash confirmed: {RNS.hexrep(dest_bytes, delimit=False)}", RNS.LOG_VERBOSE)
+
+            # Check if we have a path to this specific destination
+            if not RNS.Transport.has_path(node_dest.hash):
+                RNS.log(f"[PageFetcher] No path to computed destination {RNS.hexrep(node_dest.hash, delimit=False)}!", RNS.LOG_WARNING)
+                # The original dest_bytes might be the identity hash, not the node destination hash
+                # Try the identity hash path
+                if dest_bytes != node_dest.hash and RNS.Transport.has_path(dest_bytes):
+                    RNS.log(f"[PageFetcher] Path exists to original hash {RNS.hexrep(dest_bytes, delimit=False)} but not to node dest", RNS.LOG_VERBOSE)
+
             # Establish a link to the node
+            RNS.log(f"[PageFetcher] Creating link to {node_dest}", RNS.LOG_VERBOSE)
             self._link = RNS.Link(node_dest)
 
             request_path = path if path else PageFetcher.DEFAULT_PATH
@@ -400,12 +425,14 @@ class PageFetcher:
             # The link established callback will trigger the actual request
 
         except Exception as e:
+            RNS.log(f"[PageFetcher] Link error: {e}", RNS.LOG_ERROR)
             import traceback
             traceback.print_exc()
             self._notify_error(PageFetcher.PAGE_ERROR, "Link error: " + str(e))
 
     def _on_link_established(self, link):
         """Called when the RNS link is established. Sends the page request."""
+        RNS.log(f"[PageFetcher] Link established: {link}", RNS.LOG_VERBOSE)
         self.status = PageFetcher.LINK_ESTABLISHED
 
         request_path = self.current_path if self.current_path else PageFetcher.DEFAULT_PATH
@@ -413,7 +440,8 @@ class PageFetcher:
         # Send the request via RNS.Link.request()
         # The request path is sent as bytes; the node's request handler
         # will match it and return the page content.
-        link.request(
+        RNS.log(f"[PageFetcher] Sending request for {request_path}", RNS.LOG_VERBOSE)
+        receipt = link.request(
             request_path.encode("utf-8"),
             data=None,
             response_callback=self._on_request_response,
@@ -421,9 +449,16 @@ class PageFetcher:
             progress_callback=self._on_request_progress,
             timeout=PageFetcher.DEFAULT_TIMEOUT,
         )
+        if receipt is False:
+            RNS.log(f"[PageFetcher] link.request() returned False (could not send)", RNS.LOG_WARNING)
+            self._notify_error(PageFetcher.PAGE_ERROR, "Could not send request")
+        else:
+            RNS.log(f"[PageFetcher] Request sent, receipt status: {receipt.status}", RNS.LOG_VERBOSE)
+
         self.status = PageFetcher.REQUEST_SENT
 
     def _on_link_closed(self, link):
+        RNS.log(f"[PageFetcher] Link closed (status={self.status}): {link}", RNS.LOG_VERBOSE)
         if self.status == PageFetcher.REQUEST_SENT or self.status == PageFetcher.ESTABLISHING_LINK:
             self._notify_error(PageFetcher.PAGE_TIMEOUT, "Connection closed before response")
 
@@ -434,6 +469,8 @@ class PageFetcher:
         Call get_response() to get the response data as bytes.
         """
         response = request_receipt.get_response()
+        response_size = len(response) if response else 0
+        RNS.log(f"[PageFetcher] Response received: {response_size} bytes", RNS.LOG_VERBOSE)
         self.response_received(response)
 
     def _on_request_failed(self, request_receipt):
@@ -445,14 +482,17 @@ class PageFetcher:
                 RNS.RequestReceipt.SENT: "Request not delivered",
             }
             reason = status_map.get(request_receipt.status, f"Request status {request_receipt.status}")
+        RNS.log(f"[PageFetcher] Request failed: {reason}", RNS.LOG_WARNING)
         self._notify_error(PageFetcher.REQUEST_FAILED, reason)
 
     def _on_request_progress(self, request_receipt):
         """Called periodically during response download."""
+        RNS.log(f"[PageFetcher] Request progress: {request_receipt.progress}", RNS.LOG_EXTREME)
         if self._on_progress:
             self._on_progress(request_receipt.progress, 0, 0)
 
     def _on_timeout(self):
+        RNS.log(f"[PageFetcher] Timeout (status={self.status})", RNS.LOG_VERBOSE)
         if self.status != PageFetcher.RESPONSE_RECEIVED and self.status != PageFetcher.CACHED:
             self._notify_error(PageFetcher.PAGE_TIMEOUT, "Request timed out")
 
