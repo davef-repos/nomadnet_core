@@ -33,6 +33,7 @@ class PageFetcher:
 
     DEFAULT_TIMEOUT    = 10
     DEFAULT_CACHE_TIME = 12 * 60 * 60
+    DEFAULT_PATH       = "/page/index.mu"
 
     NO_PATH            = 0x00
     PATH_REQUESTED     = 0x01
@@ -303,7 +304,11 @@ class PageFetcher:
     # --- Network request ---
 
     def _request_from_node(self, dest_hash, path, request_data=None):
-        """Initiate a network request to a node."""
+        """Initiate a network request to a node.
+
+        If no path is known yet, requests path resolution and resolves
+        it asynchronously via a background thread using RNS.Transport.await_path.
+        """
         try:
             dest_bytes = bytes.fromhex(dest_hash)
         except (ValueError, AttributeError) as e:
@@ -313,55 +318,139 @@ class PageFetcher:
         if not RNS.Transport.has_path(dest_bytes):
             self.status = PageFetcher.PATH_REQUESTED
             RNS.Transport.request_path(dest_bytes)
-            # The path will be resolved asynchronously; we wait for the
-            # callback via RNS.Transport path responses, then establish link.
-            # For now, the external system should re-call after path is known.
-            self._notify_error(PageFetcher.PAGE_NO_PATH,
-                               "No path to " + RNS.hexrep(dest_bytes, delimit=False))
+
+            # Start a background thread that waits for path resolution
+            # using RNS.Transport.await_path (blocks with its own timeout).
+            # This keeps the caller unblocked while path discovery happens.
+            def wait_for_path(dest_bytes, path, request_data):
+                try:
+                    timeout = self.DEFAULT_TIMEOUT
+                    path_found = RNS.Transport.await_path(dest_bytes, timeout=timeout)
+                    if path_found:
+                        # Double-check we haven't been cancelled/disconnected
+                        if self.status in (PageFetcher.CONNECTION_CLOSED, PageFetcher.NO_PATH):
+                            return
+                        self.status = PageFetcher.ESTABLISHING_LINK
+                        self._establish_link(dest_bytes, path, request_data)
+                    else:
+                        self._notify_error(PageFetcher.PAGE_NO_PATH,
+                                           "No path to " + RNS.hexrep(dest_bytes, delimit=False))
+                except Exception as e:
+                    self._notify_error(PageFetcher.PAGE_ERROR,
+                                       "Path resolution error: " + str(e))
+
+            t = threading.Thread(
+                target=wait_for_path,
+                args=(dest_bytes, path, request_data),
+                daemon=True,
+            )
+            t.start()
             return
 
         self.status = PageFetcher.ESTABLISHING_LINK
         self._establish_link(dest_bytes, path, request_data)
 
     def _establish_link(self, dest_bytes, path, request_data=None):
-        """Establish an LXMF link and request the page."""
+        """Establish a Reticulum link to the node and request the page.
+
+        Uses RNS.Link + link.request() to fetch pages via the node's
+        registered request handlers ("nomadnetwork", "node" aspect).
+        """
         try:
-            self._link = LXMF.LXMLink(
-                destination_hash=dest_bytes,
-                router=self.app.message_router,
+            # Recall the identity from the destination hash
+            identity = RNS.Identity.recall(dest_bytes)
+            if identity is None:
+                self._notify_error(PageFetcher.PAGE_NO_PATH,
+                                   "Unknown identity for " + RNS.hexrep(dest_bytes, delimit=False))
+                return
+
+            # Create an outbound destination matching the node's aspect
+            node_dest = RNS.Destination(
+                identity,
+                RNS.Destination.OUT,
+                RNS.Destination.SINGLE,
+                "nomadnetwork",
+                "node",
             )
 
-            # Register link callbacks
-            self._link.set_link_established_callback(self._on_link_established)
-            self._link.set_link_closed_callback(self._on_link_closed)
+            # Establish a link to the node
+            self._link = RNS.Link(node_dest)
 
-            # Package the request
             request_path = path if path else PageFetcher.DEFAULT_PATH
 
             self._request_data = request_data
             self._partials = {}
 
-            # Send request
-            request_payload = request_path.encode("utf-8")
-            self._link.send(request_payload)
+            # Register link callbacks
+            self._link.set_link_established_callback(self._on_link_established)
+            self._link.set_link_closed_callback(self._on_link_closed)
 
-            self.status = PageFetcher.REQUEST_SENT
-
-            # Set timeout
-            self._timeout_timer = threading.Timer(PageFetcher.DEFAULT_TIMEOUT,
-                                                    self._on_timeout)
+            # Set a generous timeout for the overall operation (link establishment
+            # + request). The link.request() call has its own shorter timeout
+            # that covers just the request/response exchange.
+            overall_timeout = PageFetcher.DEFAULT_TIMEOUT * 2
+            self._timeout_timer = threading.Timer(
+                overall_timeout,
+                self._on_timeout,
+            )
             self._timeout_timer.daemon = True
             self._timeout_timer.start()
 
+            # Wait for link to be established before sending request
+            # The link established callback will trigger the actual request
+
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             self._notify_error(PageFetcher.PAGE_ERROR, "Link error: " + str(e))
 
     def _on_link_established(self, link):
+        """Called when the RNS link is established. Sends the page request."""
         self.status = PageFetcher.LINK_ESTABLISHED
 
+        request_path = self.current_path if self.current_path else PageFetcher.DEFAULT_PATH
+
+        # Send the request via RNS.Link.request()
+        # The request path is sent as bytes; the node's request handler
+        # will match it and return the page content.
+        link.request(
+            request_path.encode("utf-8"),
+            data=None,
+            response_callback=self._on_request_response,
+            failed_callback=self._on_request_failed,
+            progress_callback=self._on_request_progress,
+            timeout=PageFetcher.DEFAULT_TIMEOUT,
+        )
+        self.status = PageFetcher.REQUEST_SENT
+
     def _on_link_closed(self, link):
-        if self.status == PageFetcher.REQUEST_SENT:
+        if self.status == PageFetcher.REQUEST_SENT or self.status == PageFetcher.ESTABLISHING_LINK:
             self._notify_error(PageFetcher.PAGE_TIMEOUT, "Connection closed before response")
+
+    def _on_request_response(self, request_receipt):
+        """Called when a page response is received from the node.
+
+        The request_receipt is a RNS.RequestReceipt instance.
+        Call get_response() to get the response data as bytes.
+        """
+        response = request_receipt.get_response()
+        self.response_received(response)
+
+    def _on_request_failed(self, request_receipt):
+        """Called when a page request fails."""
+        reason = "Request failed"
+        if hasattr(request_receipt, 'status'):
+            status_map = {
+                RNS.RequestReceipt.FAILED: "Request failed",
+                RNS.RequestReceipt.SENT: "Request not delivered",
+            }
+            reason = status_map.get(request_receipt.status, f"Request status {request_receipt.status}")
+        self._notify_error(PageFetcher.REQUEST_FAILED, reason)
+
+    def _on_request_progress(self, request_receipt):
+        """Called periodically during response download."""
+        if self._on_progress:
+            self._on_progress(request_receipt.progress, 0, 0)
 
     def _on_timeout(self):
         if self.status != PageFetcher.RESPONSE_RECEIVED and self.status != PageFetcher.CACHED:
