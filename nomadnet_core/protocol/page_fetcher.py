@@ -411,10 +411,10 @@ class PageFetcher:
         request_path = self.current_path if self.current_path else PageFetcher.DEFAULT_PATH
 
         # Send the request via RNS.Link.request()
-        # The request path is sent as bytes; the node's request handler
-        # will match it and return the page content.
+        # The node's request handler will match the path and return
+        # the page content.
         link.request(
-            request_path.encode("utf-8"),
+            request_path,
             data=None,
             response_callback=self._on_request_response,
             failed_callback=self._on_request_failed,
