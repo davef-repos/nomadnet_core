@@ -95,6 +95,6 @@ class MyNeovimBackend(UIBackend):
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+GNU General Public License v3.0 — see [LICENSE](./LICENSE).
 
 This package is extracted from [NomadNet](https://github.com/markqvist/NomadNet) by Mark Qvist.
